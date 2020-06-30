@@ -1,0 +1,370 @@
+#!/usr/bin/env python
+
+import sys, socket, select, time, json, random
+
+DEBUG = 0
+# -- constant for all service
+state = 'F'
+current_term = 0
+voted_for = None
+log = [{'term' : 0}]
+commit_index = 0
+state_machine = {}
+leader_id = 'FFFF' 
+LEADER_TIMEOUT = 0.2
+# -- constant for leader only
+next_index = dict()
+
+# -- TIMEOUT init begin
+TIMEOUT = random.uniform(0.22, 0.42)
+
+
+
+def election(sock):
+	global current_term
+	global state
+	global leader_id
+	global voted_for
+	global next_index
+
+	if DEBUG:
+		print(my_id + " ========== Enter Election, Time: ", time.time())
+
+	current_term += 1
+	state = 'C'
+	vote = 1
+	disvote = 0
+	voted_for = my_id
+	startTime = time.time()
+	if leader_id != 'FFFF':
+		localTimeOut = random.uniform(0.4, 0.6)
+	else:
+		localTimeOut = random.uniform(0.1, 0.2)
+	dup_replica = replica_ids[:]
+
+	# TODO: Log up to date 
+	
+	request_msg = {'src': my_id, 'leader': leader_id, 'type': 'RequestVote',
+	 'term':current_term, 'candidateId': my_id,
+	  'lastLogIndex' : len(log) - 1, 'lastLogTerm' : log[len(log) - 1]['term'] }
+
+	for i in replica_ids:
+		request_msg['dst'] = i
+		if DEBUG:
+			print("Candidate " + my_id + " Send a message to", request_msg)
+		sock.send(json.dumps(request_msg))
+
+	electionTime = 0
+	while vote < (len(replica_ids) // 2) + 1 and electionTime < localTimeOut  and disvote < (len(replica_ids) // 2) + 1:
+		
+		ready = select.select([sock], [], [], 0.1)[0]
+		if sock in ready:
+			msg_row = sock.recv(32768)
+			if msg_row == 0:
+				electionTime = time.time() - startTime
+				continue
+
+			msg = json.loads(msg_row)
+
+			if DEBUG:
+				print('------ During Election Received ' + my_id, msg)
+
+			if msg['type'] == 'ReplyVote' and msg['term'] > current_term:
+				current_term = msg['term']
+				state = 'F'
+				voted_for = None
+				return 
+
+			if msg['type'] in ['put', 'get']:
+				handleRedictMessage(sock, msg)
+
+			if msg['type'] == 'ReplyVote':
+				if msg['src'] in dup_replica:
+					if msg['voteGranted'] == 'True':
+						vote += 1
+					else:
+						disvote += 1
+					dup_replica.remove(msg['src'])	
+				electionTime = time.time() - startTime
+				continue
+			
+			if msg['type'] == 'AppendEntries' and msg['term'] >= current_term:
+				handleAppend(msg, sock)
+				return
+
+		electionTime = time.time() - startTime
+
+	if vote >= (len(replica_ids) // 2) + 1:
+		if DEBUG:
+			print(my_id + ' Become the new leader')
+		state = 'L'
+		leader_id = my_id
+		for i in replica_ids:
+			next_index[i] = commit_index + 1
+		heartbeatMechanism(sock)
+		return 
+
+	if disvote >= (len(replica_ids) // 2) + 1:
+		state = 'F'
+		voted_for = None
+		leader_id = msg['leader']
+		return
+
+
+	if electionTime > localTimeOut:
+		return election(sock)
+
+
+
+
+########################### Heart Beat ########
+def heartbeatMechanism(sock):
+	msg = {'src': my_id, 'leader': my_id,
+	 'type': 'AppendEntries', 'term': current_term, 'prevLogIndex' : len(log) - 1,
+	  'prevLogTerm' : log[len(log) - 1]['term'], 'entries' : [], 'leaderCommit' : commit_index}
+	for i in next_index:
+		msg['dst'] = i
+
+		if DEBUG:
+			print(" =========== HEARTBEAT " + my_id, msg)
+		sock.send(json.dumps(msg))
+		
+
+
+########################### Message Handle function ################
+def handlePut(sock):
+	global log
+	msg = {'src': my_id, 'dst' : 'FFFF', 'leader': my_id,
+	 'type': 'AppendEntries', 'term': current_term, 'prevLogIndex' : len(log) - 1,
+	  'prevLogTerm' : log[len(log) - 1]['term'], 'entries' : [], 'leaderCommit' : commit_index}
+	
+	for i in next_index:
+		msg['dst'] = i
+		msg['logFrom'] = next_index[i]
+		if len(log[next_index[i]:]) > 30:
+			msg['entries'] = log[next_index[i]:next_index[i] + 30]
+		else:
+			msg['entries'] = log[next_index[i]:]
+		if DEBUG:
+			if len(log[next_index[i]:]) < 6:
+				print("==================== SEND PUT TO ALL REPLICA " + my_id , msg)
+			else:
+				print("==================== SEND PUT TO ALL REPLICA A LONG PUT " + my_id + " " + msg['dst'])
+		sock.send(json.dumps(msg))
+	
+
+
+
+def handleRequestVote(msg):
+	global current_term
+	global voted_for
+	global state
+
+	reply_msg = {}
+
+	if (voted_for == None or voted_for == msg['candidateId']) and msg['lastLogIndex'] >= len(log) - 1 and msg['term'] >= current_term:
+		state = 'F'
+		current_term = msg['term']
+		reply_msg = {'src': my_id, 'dst': msg['candidateId'], 'leader': leader_id, 'type': 'ReplyVote', 'term' : current_term, 'voteGranted' : 'True'}
+		voted_for = msg['candidateId']
+		sock.send(json.dumps(reply_msg))
+	else:
+		current_term = msg['term']
+		reply_msg = {'src': my_id, 'dst': msg['candidateId'], 'leader': leader_id, 'type': 'ReplyVote', 'term' : current_term, 'voteGranted' : 'False'}
+		if DEBUG:
+			print(my_id + ' REPLY MESSAGE, NO,', reply_msg)
+		sock.send(json.dumps(reply_msg))
+		
+	if DEBUG:
+		print(my_id + ' Vote for Candidate ' + msg['candidateId'] + ' The decision is ' + reply_msg['voteGranted']) 
+
+			
+
+# TODO append Entry
+def handleRedictMessage(sock, msg):
+	reply_msg = {"src": msg['dst'], "dst": msg['src'], "leader": leader_id, "type": "redirect", "MID": msg['MID']}
+	if DEBUG:
+		print(my_id + ' Redirect Message ', reply_msg)
+	sock.send(json.dumps(reply_msg))
+
+
+
+def handleClientRequest(sock, msg):
+	global log
+	global commit_index
+	global leader_id
+
+	if DEBUG:
+		print(my_id + " Leader Received From Client ", msg)
+
+	# For mileStone
+	if msg['type'] == 'get':
+		msg_save = msg.copy()
+		msg_save['term'] = current_term
+		if  msg['key'] in state_machine:
+			reply_msg = {"src": my_id, "dst": msg['src'], "leader": leader_id,
+			 "type": "ok", "MID": msg['MID'],"value": state_machine[msg['key']]}
+		else:
+			reply_msg = {"src": my_id, "dst": msg['src'], "leader": leader_id, "type": "fail", "MID": msg['MID']}
+		sock.send(json.dumps(reply_msg))
+		if DEBUG:
+			print(my_id + " send Back to Client About Get", reply_msg)
+	else:
+		if msg['key'] in state_machine:
+			if state_machine[msg['key']] == msg['value']:
+				reply_msg = {"src": my_id, "dst": msg['src'], "leader": leader_id, "type": "ok", "MID": msg['MID']}	
+				if DEBUG:
+					print(" Leader Send back a duplicate request: " + my_id, msg)
+				sock.send(json.dumps(reply_msg))
+				return
+		
+		msg_save = msg.copy()
+		msg_save['term'] = current_term
+		msg_save['leader'] = leader_id
+		log.append(msg_save)
+		handlePut(sock)
+
+
+
+def handleAppend(msg, sock):
+	global log
+	global current_term
+	global state
+	global leader_id
+	global voted_for
+	global commit_index
+
+	if msg['term'] < current_term:
+		return
+	
+	if msg['term'] > current_term:
+		voted_for = None
+		leader_id = msg['leader']
+		current_term = msg['term']
+		if state == 'L':
+			for i in range(commit_index,len(log) - 1):
+				handleRedictMessage(sock, log[i]) 
+		if commit_index < msg['leaderCommit']:
+			log = log[:commit_index]
+		
+
+	current_term = msg['term']
+	state = 'F'
+	leader_id = msg['leader']
+
+	if(msg['entries']) == []:
+		voted_for = None
+		reply_msg = {"src": my_id, "dst": msg['src'], "leader": leader_id, "type": "replyAppend",
+		 "term" : current_term, "lastLogIndex" : len(log) - 1, "result" : "ok"}
+	else:
+		appendFrom = msg['logFrom']
+		log = log[:appendFrom] + msg['entries']
+		reply_msg = {"src": my_id, "dst": msg['src'], "leader": leader_id, "type": "replyAppend",
+		 "term" : current_term, "lastLogIndex" : len(log) - 1, "result" : "ok"}
+
+	if DEBUG:
+		print(my_id + "  REPLY MESSAGE TO THE LEADER ", reply_msg)
+	sock.send(json.dumps(reply_msg))
+
+	#  and len(log) - 1 >= msg['leaderCommit']
+	while commit_index < msg['leaderCommit'] and commit_index < len(log) - 1:
+		commit_index += 1
+		log_msg = log[commit_index]
+		state_machine[log_msg['key']] = log_msg['value']
+
+
+
+def handleConfirmAppend(msg, sock):
+	global log
+	global commit_index
+	global next_index
+	global current_term
+
+	if msg['term'] > current_term:
+		current_term = msg['term']
+		return
+
+	
+	next_index[msg['src']] = msg['lastLogIndex'] + 1
+	vote = 0
+
+	while msg['lastLogIndex'] > commit_index:
+		for i in next_index:
+			if next_index[i] - 1 >= commit_index + 1:
+				vote += 1
+		if vote >= (len(replica_ids) // 2):
+			commit_index += 1
+			log_msg = log[commit_index]
+			state_machine[log_msg['key']] = log_msg['value']
+			if log_msg['term'] == current_term or log_msg['leader'] == my_id:
+				reply_msg = {"src": my_id, "dst": log_msg['src'], "leader": leader_id, "type": "ok", "MID": log_msg['MID']}
+				if DEBUG:
+					print(" Leader RESPONSE A VALUE TO CLIENT", reply_msg)
+				sock.send(json.dumps(reply_msg)) 
+		else:
+			break
+
+
+if __name__ == "__main__":
+	global my_id
+	global replica_ids
+	 # Your ID number
+	my_id = sys.argv[1]
+	# The ID numbers of all the other replicas
+	replica_ids = sys.argv[2:]
+	
+	
+	# Connect to the network. All messages to/from other replicas and clients will
+	# occur over this socket
+	sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+	sock.connect(my_id)
+
+	local_time = time.time()
+
+	while True:
+		ready = select.select([sock], [], [], 0.1)[0]
+		if sock in ready:
+			msg_raw = sock.recv(32768)
+			if len(msg_raw) == 0: continue
+			msg = json.loads(msg_raw)
+
+			if DEBUG:
+				print(my_id + " Received Msg ", msg)
+
+			if msg['src'] == leader_id:
+				local_time = time.time()
+			
+			if msg['type'] == 'RequestVote':
+				handleRequestVote(msg)
+				local_time = time.time()
+
+			if msg['type'] == 'AppendEntries':
+				handleAppend(msg, sock)
+				local_time = time.time()
+
+			if msg['type'] == 'replyAppend':
+				handleConfirmAppend(msg, sock)
+				
+			if msg['type'] in ['get', 'put']:
+				if state != 'L':
+					handleRedictMessage(sock, msg)
+				else:
+					handleClientRequest(sock, msg)
+					if msg['type'] == 'put':
+						local_time = time.time()
+					
+
+		if leader_id == 'FFFF' and (time.time() - local_time) > TIMEOUT:
+			if state != 'L':
+				election(sock)
+				local_time = time.time()
+		
+		if (time.time() - local_time) > (TIMEOUT + 0.42):
+			if state != 'L':
+				election(sock)
+				local_time = time.time()
+		
+		if (time.time() - local_time) > LEADER_TIMEOUT:
+			if state == 'L':
+				heartbeatMechanism(sock)
+				local_time = time.time()
